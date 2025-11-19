@@ -320,6 +320,73 @@ async def aria_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Execution Error: {e}")
 
+
+async def forceupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: force upload a file from the downloads folder by partial filename match.
+    Usage: /forceupload <partial-or-full-filename>
+    """
+    if not is_owner(update):
+        return
+
+    args = context.args if hasattr(context, 'args') else []
+    if not args:
+        await update.message.reply_text("Usage: /forceupload <partial-or-full-filename>")
+        return
+
+    query = " ".join(args).lower()
+
+    try:
+        if not os.path.exists(DOWNLOAD_DIR):
+            await update.message.reply_text("📭 Downloads directory does not exist.")
+            return
+
+        matches = []
+        for entry in os.scandir(DOWNLOAD_DIR):
+            if entry.is_file():
+                if query in entry.name.lower():
+                    matches.append(entry.path)
+
+        if not matches:
+            await update.message.reply_text("❌ No files matched that query in downloads.")
+            return
+
+        # If multiple matches, pick the largest (likely the target file)
+        matches.sort(key=lambda p: os.path.getsize(p), reverse=True)
+        file_path = matches[0]
+        file_size = os.path.getsize(file_path)
+
+        LIMIT_BYTES = 2000 * 1024 * 1024
+        if file_size > LIMIT_BYTES:
+            await update.message.reply_text(f"⚠️ File is larger than Telegram limit (2GB): {file_size} bytes")
+            return
+
+        file_name = os.path.basename(file_path)
+        msg = await update.message.reply_text(f"⬆️ Forcing upload: `{file_name}` ({file_size//1024} KiB)...", parse_mode='Markdown')
+
+        try:
+            with open(file_path, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    caption=f"📂 {file_name}",
+                    read_timeout=600,
+                    write_timeout=600,
+                    connect_timeout=300
+                )
+            await msg.delete()
+            # Remove file after successful upload to free space
+            try:
+                os.remove(file_path)
+            except Exception:
+                logger.exception("Failed to remove uploaded file from disk")
+            await update.message.reply_text("✅ Forced upload finished and file removed.")
+
+        except Exception as upload_error:
+            await msg.edit_text(f"❌ Upload Failed: {upload_error}")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Execution Error: {e}")
+
 # --- MAIN ENTRY POINT ---
 if __name__ == '__main__':
     if not BOT_TOKEN:
@@ -373,6 +440,7 @@ if __name__ == '__main__':
         app_bot.add_handler(CommandHandler("debugaria", debug_aria))
         app_bot.add_handler(CommandHandler("lsdownloads", lsdownloads))
         app_bot.add_handler(CommandHandler("aria", aria_status_cmd))
+        app_bot.add_handler(CommandHandler("forceupload", forceupload))
         app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
         app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
@@ -413,6 +481,7 @@ if __name__ == '__main__':
         app_bot.add_handler(CommandHandler("debugaria", debug_aria))
         app_bot.add_handler(CommandHandler("lsdownloads", lsdownloads))
         app_bot.add_handler(CommandHandler("aria", aria_status_cmd))
+        app_bot.add_handler(CommandHandler("forceupload", forceupload))
         app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
         app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
