@@ -6,6 +6,7 @@ import asyncio
 import aria2p
 import nest_asyncio
 import requests
+from urllib.parse import urlparse
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -290,9 +291,15 @@ if __name__ == '__main__':
             logger.error("WEBHOOK_DOMAIN or RENDER_EXTERNAL_URL is not set. Cannot register webhook.")
             exit(1)
 
+        # Normalize WEBHOOK_DOMAIN: strip scheme and trailing slashes
+        parsed = urlparse(WEBHOOK_DOMAIN)
+        domain = parsed.netloc or parsed.path  # netloc when scheme present, else path
+        domain = domain.rstrip('/')
+
         url_path = f"/webhook/{BOT_TOKEN}"
         port = int(os.environ.get('PORT', 8080))
-        webhook_url = f"https://{WEBHOOK_DOMAIN}{url_path}"
+        webhook_url = f"https://{domain}{url_path}"
+        logger.info(f"Registering webhook URL: {webhook_url}")
 
         # Run webhook server that listens for Telegram updates
         app_bot.run_webhook(
