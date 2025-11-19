@@ -234,6 +234,33 @@ async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         await update.message.reply_text(f"❌ Error handling .torrent: {e}")
 
+
+async def debug_aria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only command to query aria2 JSON-RPC getGlobalStat and return output.
+    """
+    if not is_owner(update):
+        return
+
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:6800/jsonrpc",
+            json={"jsonrpc":"2.0","id":"test","method":"aria2.getGlobalStat"},
+            timeout=5
+        )
+
+        if resp.ok:
+            # Return a short message (truncate if very long)
+            text = resp.text
+            if len(text) > 1800:
+                text = text[:1800] + "... (truncated)"
+            await update.message.reply_text(f"✅ Aria2 Response:\n`{text}`", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ No response. Status: {resp.status_code} - {resp.text}")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Execution Error: {e}")
+
 # --- MAIN ENTRY POINT ---
 if __name__ == '__main__':
     if not BOT_TOKEN:
@@ -284,6 +311,7 @@ if __name__ == '__main__':
 
         # Add Handlers
         app_bot.add_handler(CommandHandler("start", start))
+        app_bot.add_handler(CommandHandler("debugaria", debug_aria))
         app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
         app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
@@ -321,6 +349,7 @@ if __name__ == '__main__':
 
         # Add Handlers
         app_bot.add_handler(CommandHandler("start", start))
+        app_bot.add_handler(CommandHandler("debugaria", debug_aria))
         app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
         app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
