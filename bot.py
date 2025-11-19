@@ -7,6 +7,8 @@ import aria2p
 import nest_asyncio
 import requests
 from urllib.parse import urlparse
+import re
+import difflib
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -333,7 +335,12 @@ async def forceupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /forceupload <partial-or-full-filename>")
         return
 
-    query = " ".join(args).lower()
+    query_raw = " ".join(args)
+    # Normalize query: remove non-alphanumeric, collapse whitespace, lowercase
+    def _normalize(s: str) -> str:
+        return re.sub(r'[^0-9a-z]+', ' ', s.lower()).strip()
+
+    query = _normalize(query_raw)
 
     try:
         if not os.path.exists(DOWNLOAD_DIR):
@@ -341,13 +348,33 @@ async def forceupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         matches = []
+        names = []
         for entry in os.scandir(DOWNLOAD_DIR):
             if entry.is_file():
-                if query in entry.name.lower():
-                    matches.append(entry.path)
+                names.append((entry.name, entry.path))
+
+        # First pass: normalized substring match
+        for name, path in names:
+            if query in _normalize(name):
+                matches.append(path)
+
+        # If no normalized substring matches, try fuzzy matching on normalized names
+        if not matches:
+            normalized_names = [(_normalize(n), p) for n, p in names]
+            choices = [n for n, p in normalized_names]
+            close = difflib.get_close_matches(query, choices, n=5, cutoff=0.6)
+            for c in close:
+                for n, p in normalized_names:
+                    if n == c:
+                        matches.append(p)
+                        break
 
         if not matches:
-            await update.message.reply_text("❌ No files matched that query in downloads.")
+            # Suggest top filenames if available
+            suggestion_text = "\n".join([n for n, p in names][:10]) if names else "(no files)"
+            await update.message.reply_text(
+                "❌ No files matched that query in downloads.\nAvailable files:\n" + suggestion_text
+            )
             return
 
         # If multiple matches, pick the largest (likely the target file)
