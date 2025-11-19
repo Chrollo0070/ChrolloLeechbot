@@ -5,6 +5,7 @@ import logging
 import asyncio
 import aria2p
 import nest_asyncio
+import requests
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -17,6 +18,11 @@ nest_asyncio.apply()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # Default to the ID you provided if not set in Env
 OWNER_ID = int(os.environ.get("OWNER_ID", "11111111")) 
+
+# Use webhook instead of polling when set to '1'
+USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"
+# Domain used for webhook URL (Render sets RENDER_EXTERNAL_URL automatically)
+WEBHOOK_DOMAIN = os.environ.get("WEBHOOK_DOMAIN") or os.environ.get("RENDER_EXTERNAL_URL")
 
 ARIA2_PORT = 6800
 DOWNLOAD_DIR = "/app/downloads"
@@ -232,21 +238,66 @@ if __name__ == '__main__':
     if not BOT_TOKEN:
         print("CRITICAL: BOT_TOKEN env variable is missing.")
         exit(1)
+    # If using polling mode, ensure no webhook is set (Telegram will return 409 if webhook exists)
+    if not USE_WEBHOOK:
+        try:
+            logger.info("Checking Telegram webhook status before starting polling...")
+            resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=10)
+            if resp.ok:
+                info = resp.json().get('result', {})
+                url = info.get('url')
+                if url:
+                    logger.warning(f"Detected active webhook: {url}. Deleting webhook to allow polling.")
+                    delr = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
+                    if delr.ok and delr.json().get('result'):
+                        logger.info("Deleted existing webhook. Proceeding with polling.")
+                    else:
+                        logger.error(f"Failed to delete webhook: {delr.text}")
+        except Exception as e:
+            logger.error(f"Failed to check/delete webhook: {e}")
 
-    print("--- Starting Keep-Alive Web Server ---")
-    # Run Flask in a separate thread
-    server_thread = threading.Thread(target=run_web_server)
-    server_thread.daemon = True
-    server_thread.start()
+    # Start whichever web server is needed
+    if USE_WEBHOOK:
+        # In webhook mode we will let the bot run the web server for incoming updates.
+        print("--- Starting Telegram Bot in WEBHOOK mode ---")
+        # Setup Bot
+        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    print("--- Starting Telegram Bot ---")
-    # Setup Bot
-    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Add Handlers
-    app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
-    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    
-    # Run Bot
-    app_bot.run_polling()
+        # Add Handlers
+        app_bot.add_handler(CommandHandler("start", start))
+        app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
+        app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+        if not WEBHOOK_DOMAIN:
+            logger.error("WEBHOOK_DOMAIN or RENDER_EXTERNAL_URL is not set. Cannot register webhook.")
+            exit(1)
+
+        url_path = f"/webhook/{BOT_TOKEN}"
+        port = int(os.environ.get('PORT', 8080))
+        webhook_url = f"https://{WEBHOOK_DOMAIN}{url_path}"
+
+        # Run webhook server that listens for Telegram updates
+        app_bot.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url
+        )
+    else:
+        print("--- Starting Keep-Alive Web Server ---")
+        # Run Flask in a separate thread (keeps the instance alive for Render)
+        server_thread = threading.Thread(target=run_web_server)
+        server_thread.daemon = True
+        server_thread.start()
+
+        print("--- Starting Telegram Bot (polling) ---")
+        # Setup Bot
+        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+
+        # Add Handlers
+        app_bot.add_handler(CommandHandler("start", start))
+        app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
+        app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+        # Run Bot (polling)
+        app_bot.run_polling()
