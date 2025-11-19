@@ -4,6 +4,9 @@ FROM python:3.11-slim
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Run bot in webhook mode by default on Render (can be overridden in Render env vars)
+ENV USE_WEBHOOK=1
+
 # Install Aria2 and curl. Use no-install-recommends to keep image small
 # and clean apt lists after installation to reduce image size.
 RUN apt-get update && \
