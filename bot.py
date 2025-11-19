@@ -250,7 +250,25 @@ if __name__ == '__main__':
                     logger.warning(f"Detected active webhook: {url}. Deleting webhook to allow polling.")
                     delr = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
                     if delr.ok and delr.json().get('result'):
-                        logger.info("Deleted existing webhook. Proceeding with polling.")
+                        logger.info("Requested webhook deletion. Waiting for Telegram to clear webhook...")
+                        # Wait until Telegram reports no webhook URL or until timeout
+                        cleared = False
+                        for i in range(10):
+                            try:
+                                time.sleep(1)
+                                chk = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=10)
+                                if chk.ok:
+                                    result = chk.json().get('result', {})
+                                    if not result.get('url'):
+                                        cleared = True
+                                        logger.info("Webhook cleared by Telegram.")
+                                        break
+                                    else:
+                                        logger.info(f"Webhook still present, waiting... (attempt {i+1})")
+                            except Exception as ee:
+                                logger.debug(f"Error while checking webhook status: {ee}")
+                        if not cleared:
+                            logger.warning("Webhook was not cleared within timeout; polling may still receive 409 Conflict.")
                     else:
                         logger.error(f"Failed to delete webhook: {delr.text}")
         except Exception as e:
