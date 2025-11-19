@@ -1,9 +1,13 @@
 # Use Python 3.10 Slim image
-FROM python:3.10-slim-buster
+FROM python:3.11-slim
 
-# Install Aria2 and Curl (for health checks if needed)
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Aria2 and curl. Use no-install-recommends to keep image small
+# and clean apt lists after installation to reduce image size.
 RUN apt-get update && \
-    apt-get install -y aria2 curl && \
+    apt-get install -y --no-install-recommends aria2 curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Set working directory
