@@ -3,6 +3,8 @@ import time
 import threading
 import logging
 import asyncio
+from typing import Optional, List, Tuple
+from pathlib import Path
 import aria2p
 import nest_asyncio
 import requests
@@ -17,18 +19,16 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 nest_asyncio.apply()
 
 # --- CONFIGURATION ---
-# Get these from Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# Default to the ID you provided if not set in Env
-OWNER_ID = int(os.environ.get("OWNER_ID", "11111111")) 
-
-# Use webhook instead of polling when set to '1'
+OWNER_ID = int(os.environ.get("OWNER_ID", "11111111"))
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"
-# Domain used for webhook URL (Render sets RENDER_EXTERNAL_URL automatically)
 WEBHOOK_DOMAIN = os.environ.get("WEBHOOK_DOMAIN") or os.environ.get("RENDER_EXTERNAL_URL")
-
 ARIA2_PORT = 6800
-DOWNLOAD_DIR = "/app/downloads"
+ARIA2_RPC_URL = f"http://127.0.0.1:{ARIA2_PORT}/jsonrpc"
+DOWNLOAD_DIR = Path("/app/downloads")
+TELEGRAM_FILE_LIMIT = 2000 * 1024 * 1024  # 2GB
+STATUS_UPDATE_INTERVAL = 4  # seconds
+MAX_MESSAGE_LENGTH = 1800
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -37,480 +37,601 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- ARIA2 CONNECT ---
-# Connects to the local aria2 instance running in background
-aria2 = aria2p.API(
-    aria2p.Client(
-        host="http://localhost",
-        port=ARIA2_PORT,
-        secret=""
-    )
-)
+# --- ARIA2 CONNECTION (Singleton) ---
+_aria2_instance = None
+
+def get_aria2():
+    """Lazy initialization of aria2 client"""
+    global _aria2_instance
+    if _aria2_instance is None:
+        _aria2_instance = aria2p.API(
+            aria2p.Client(
+                host="http://localhost",
+                port=ARIA2_PORT,
+                secret=""
+            )
+        )
+    return _aria2_instance
 
 # --- FLASK SERVER (KEEP-ALIVE) ---
-# Render requires a web server listening on a port to keep the service "healthy"
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is Running and Active!"
 
+@app.route('/health')
+def health():
+    """Health check endpoint for monitoring"""
+    return {"status": "healthy", "timestamp": time.time()}
+
 def run_web_server():
-    # Render assigns the PORT env variable automatically
+    """Run Flask server for keep-alive"""
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Disable Flask's default logger to reduce noise
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.WARNING)
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
-# --- BOT LOGIC ---
+# --- UTILITY FUNCTIONS ---
 
-def is_owner(update: Update):
+def is_owner(update: Update) -> bool:
+    """Check if user is the owner"""
     user_id = update.effective_user.id
     if user_id != OWNER_ID:
         logger.warning(f"Unauthorized access attempt by: {user_id}")
         return False
     return True
 
+def normalize_filename(filename: str) -> str:
+    """Normalize filename for fuzzy matching"""
+    return re.sub(r'[^0-9a-z]+', ' ', filename.lower()).strip()
+
+def truncate_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> str:
+    """Truncate message if it exceeds maximum length"""
+    if len(text) > max_length:
+        return text[:max_length] + "... (truncated)"
+    return text
+
+def format_size(size_bytes: int) -> str:
+    """Format file size in human-readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} TB"
+
+async def safe_edit_message(message, new_text: str, **kwargs):
+    """Safely edit message, avoiding rate limits and unchanged content"""
+    try:
+        if message.text != new_text:
+            await message.edit_text(new_text, **kwargs)
+    except Exception as e:
+        logger.debug(f"Message edit failed (likely no change or rate limit): {e}")
+
+# --- ARIA2 RPC HELPER ---
+
+def aria2_rpc_call(method: str, params: Optional[List] = None, timeout: int = 5) -> Optional[dict]:
+    """Make direct RPC call to aria2 with error handling"""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "rpc",
+            "method": method,
+            "params": params or []
+        }
+        resp = requests.post(ARIA2_RPC_URL, json=payload, timeout=timeout)
+        if resp.ok:
+            return resp.json()
+        logger.error(f"Aria2 RPC error: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        logger.error(f"Aria2 RPC call failed: {e}")
+    return None
+
+# --- DOWNLOAD MONITORING ---
+
 async def status_checker(update: Update, context: ContextTypes.DEFAULT_TYPE, download):
-    """
-    Monitors the download progress every few seconds.
-    """
+    """Monitor download progress with optimized updates"""
     gid = download.gid
-    status_msg = await update.message.reply_text(f"⏳ Added: `{download.name}`\nInitializing...", parse_mode='Markdown')
+    aria2 = get_aria2()
     
-    last_text = ""
+    try:
+        status_msg = await update.message.reply_text(
+            f"⏳ Added: `{download.name}`\nInitializing...",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Failed to send status message: {e}")
+        return
+    
+    last_progress = -1
+    last_update_time = 0
+    min_update_interval = 2  # Minimum seconds between updates
     
     while True:
         try:
             # Refresh download status
             download = aria2.get_download(gid)
+            current_time = time.time()
             
             if download.status == "active":
-                # Construct status message
-                progress = download.progress_string()
-                speed = download.download_speed_string()
-                eta = download.eta_string()
+                # Only update if significant change or enough time passed
+                current_progress = download.progress
+                time_since_update = current_time - last_update_time
                 
-                new_text = (f"⬇️ **Downloading**\n"
-                            f"Name: `{download.name}`\n"
-                            f"Progress: {progress}\n"
-                            f"Speed: {speed}\n"
-                            f"ETA: {eta}")
+                # Update if progress changed by 1% or 5+ seconds passed
+                should_update = (
+                    abs(current_progress - last_progress) >= 1.0 or
+                    time_since_update >= 5
+                )
                 
-                # Only edit message if text changed (prevents API flooding)
-                if new_text != last_text:
-                    # Check to update only every ~5 seconds ideally, 
-                    # but here we rely on loop sleep
-                    await status_msg.edit_text(new_text, parse_mode='Markdown')
-                    last_text = new_text
+                if should_update and time_since_update >= min_update_interval:
+                    new_text = (
+                        f"⬇️ **Downloading**\n"
+                        f"Name: `{download.name}`\n"
+                        f"Progress: {download.progress_string()}\n"
+                        f"Speed: {download.download_speed_string()}\n"
+                        f"ETA: {download.eta_string()}"
+                    )
+                    
+                    await safe_edit_message(status_msg, new_text, parse_mode='Markdown')
+                    last_progress = current_progress
+                    last_update_time = current_time
             
             elif download.status == "complete":
-                await status_msg.edit_text("✅ Download Complete. Preparing upload...")
+                await safe_edit_message(status_msg, "✅ Download Complete. Preparing upload...")
                 await upload_files(update, context, download)
                 break
                 
             elif download.status == "error":
-                await status_msg.edit_text(f"❌ Error: {download.error_message}")
+                error_msg = download.error_message or "Unknown error"
+                await safe_edit_message(status_msg, f"❌ Error: {error_msg}")
                 break
             
             elif download.status == "removed":
-                await status_msg.edit_text("🗑 Download was removed.")
+                await safe_edit_message(status_msg, "🗑 Download was removed.")
                 break
                 
-            await asyncio.sleep(4) # Check every 4 seconds
+            await asyncio.sleep(STATUS_UPDATE_INTERVAL)
             
         except Exception as e:
-            logger.error(f"Checker error: {e}")
+            logger.error(f"Status checker error: {e}")
             await asyncio.sleep(5)
+            # Try to recover from errors a few times before giving up
+            continue
+
+# --- FILE UPLOAD ---
 
 async def upload_files(update: Update, context: ContextTypes.DEFAULT_TYPE, download):
-    """
-    Iterates through downloaded files and uploads them to Telegram.
-    """
+    """Upload downloaded files to Telegram with optimized error handling"""
     try:
         files = download.files
         if not files:
             await update.message.reply_text("❌ Error: No files found in download.")
             return
 
+        uploaded_count = 0
+        skipped_count = 0
+
         for file_obj in files:
-            path = file_obj.path
-            if not os.path.exists(path):
+            path = Path(file_obj.path)
+            if not path.exists():
+                logger.warning(f"File not found: {path}")
                 continue
                 
-            file_name = os.path.basename(path)
-            file_size = os.path.getsize(path)
+            file_size = path.stat().st_size
             
-            # Telegram Limit check (2GB - overhead)
-            LIMIT_BYTES = 2000 * 1024 * 1024 
-            
-            if file_size > LIMIT_BYTES:
+            # Skip files larger than Telegram limit
+            if file_size > TELEGRAM_FILE_LIMIT:
                 await update.message.reply_text(
                     f"⚠️ **File Too Large**\n"
-                    f"Name: `{file_name}`\n"
-                    f"Size: {file_obj.length_string()}\n"
-                    f"Telegram limits bots to 2GB uploads.", 
+                    f"Name: `{path.name}`\n"
+                    f"Size: {format_size(file_size)}\n"
+                    f"Telegram limit: 2GB", 
                     parse_mode='Markdown'
                 )
+                skipped_count += 1
                 continue
             
-            # Uploading
-            msg = await update.message.reply_text(f"⬆️ Uploading: `{file_name}`...", parse_mode='Markdown')
+            # Upload with progress indication
+            msg = await update.message.reply_text(
+                f"⬆️ Uploading: `{path.name}` ({format_size(file_size)})...",
+                parse_mode='Markdown'
+            )
             
             try:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=open(path, 'rb'),
-                    caption=f"📂 {file_name}",
-                    read_timeout=300,  # 5 min timeout for large files
-                    write_timeout=300,
-                    connect_timeout=300
-                )
-                await msg.delete() # Delete the "Uploading" message on success
+                with open(path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        caption=f"📂 {path.name}",
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=60
+                    )
+                await msg.delete()
+                uploaded_count += 1
             except Exception as upload_error:
-                await msg.edit_text(f"❌ Upload Failed: {upload_error}")
+                logger.error(f"Upload failed for {path.name}: {upload_error}")
+                await safe_edit_message(msg, f"❌ Upload Failed: {upload_error}")
+                skipped_count += 1
 
-        # CLEANUP: Remove files from disk to free up Render space
-        download.remove(force=True, files=True)
-        await update.message.reply_text("✅ Task Finished & Cache Cleared.")
+        # Cleanup: Remove files from disk
+        try:
+            download.remove(force=True, files=True)
+            summary = f"✅ Task Finished. Uploaded: {uploaded_count}"
+            if skipped_count > 0:
+                summary += f", Skipped: {skipped_count}"
+            await update.message.reply_text(summary)
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
+            await update.message.reply_text(f"✅ Upload complete, but cleanup failed: {e}")
 
     except Exception as e:
+        logger.error(f"Critical upload error: {e}")
         await update.message.reply_text(f"❌ Critical Upload Error: {e}")
 
-# --- HANDLERS ---
+# --- BOT HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return
+    """Start command handler"""
+    if not is_owner(update):
+        return
+    
     await update.message.reply_text(
         "👋 **Welcome Owner!**\n\n"
         "Send me:\n"
-        "1. A Magnet Link\n"
-        "2. A Direct Download URL\n"
-        "3. A `.torrent` file\n\n"
-        "I will download it and upload it back to you.",
+        "• Magnet Link\n"
+        "• Direct Download URL\n"
+        "• .torrent file\n\n"
+        "I will download and upload it back to you.\n\n"
+        "**Commands:**\n"
+        "/lsdownloads - List downloaded files\n"
+        "/forceupload <filename> - Force upload a file\n"
+        "/aria [gid] - Check aria2 status\n"
+        "/debugaria - Debug aria2 connection",
         parse_mode='Markdown'
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return
+    """Handle magnet links and direct download URLs"""
+    if not is_owner(update):
+        return
     
     link = update.message.text.strip()
     
-    # Simple check to see if it looks like a link
-    if not (link.startswith("http") or link.startswith("magnet:")):
-        await update.message.reply_text("❌ That doesn't look like a valid link.")
+    # Validate link format
+    if not (link.startswith("http://") or link.startswith("https://") or link.startswith("magnet:")):
+        await update.message.reply_text("❌ Invalid link format. Send a valid HTTP(S) or magnet link.")
         return
 
     try:
+        aria2 = get_aria2()
         download = aria2.add_uris([link])
-        # Start the status checker in background
         asyncio.create_task(status_checker(update, context, download))
     except Exception as e:
+        logger.error(f"Failed to add link: {e}")
         await update.message.reply_text(f"❌ Failed to add link: {e}")
 
 async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return
+    """Handle .torrent file uploads"""
+    if not is_owner(update):
+        return
     
     try:
-        # Get the file from Telegram
         doc = update.message.document
-        file_id = doc.file_id
         file_name = doc.file_name
         
         if not file_name.endswith('.torrent'):
             await update.message.reply_text("❌ Please send a valid .torrent file.")
             return
 
-        # Download .torrent file locally
-        new_file = await context.bot.get_file(file_id)
-        temp_path = f"temp_{int(time.time())}.torrent"
+        # Download .torrent file
+        new_file = await context.bot.get_file(doc.file_id)
+        temp_path = f"/tmp/torrent_{int(time.time())}_{os.getpid()}.torrent"
         await new_file.download_to_drive(temp_path)
         
         # Add to Aria2
+        aria2 = get_aria2()
         download = aria2.add_torrent(temp_path)
         
-        # Remove the temp .torrent file
-        if os.path.exists(temp_path):
+        # Cleanup temp file
+        try:
             os.remove(temp_path)
+        except Exception:
+            pass
             
         asyncio.create_task(status_checker(update, context, download))
         
     except Exception as e:
+        logger.error(f"Error handling .torrent: {e}")
         await update.message.reply_text(f"❌ Error handling .torrent: {e}")
 
-
 async def debug_aria(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Owner-only command to query aria2 JSON-RPC getGlobalStat and return output.
-    """
+    """Debug aria2 connection and status"""
     if not is_owner(update):
         return
 
-    try:
-        resp = requests.post(
-            "http://127.0.0.1:6800/jsonrpc",
-            json={"jsonrpc":"2.0","id":"test","method":"aria2.getGlobalStat"},
-            timeout=5
-        )
-
-        if resp.ok:
-            # Return a short message (truncate if very long)
-            text = resp.text
-            if len(text) > 1800:
-                text = text[:1800] + "... (truncated)"
-            await update.message.reply_text(f"✅ Aria2 Response:\n`{text}`", parse_mode='Markdown')
-        else:
-            await update.message.reply_text(f"❌ No response. Status: {resp.status_code} - {resp.text}")
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Execution Error: {e}")
-
+    result = aria2_rpc_call("aria2.getGlobalStat")
+    
+    if result:
+        text = truncate_message(str(result))
+        await update.message.reply_text(f"✅ Aria2 Response:\n`{text}`", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ Failed to connect to aria2")
 
 async def lsdownloads(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: list files in the downloads directory with sizes."""
+    """List files in downloads directory"""
     if not is_owner(update):
         return
 
     try:
-        files = []
-        if os.path.exists(DOWNLOAD_DIR):
-            for entry in os.scandir(DOWNLOAD_DIR):
-                if entry.is_file():
-                    size = entry.stat().st_size
-                    files.append((entry.name, size))
+        if not DOWNLOAD_DIR.exists():
+            await update.message.reply_text("📭 Downloads directory does not exist.")
+            return
+
+        files: List[Tuple[str, int]] = []
+        for entry in DOWNLOAD_DIR.iterdir():
+            if entry.is_file():
+                files.append((entry.name, entry.stat().st_size))
 
         if not files:
             await update.message.reply_text("📭 No files in downloads directory.")
             return
 
-        lines = []
-        for name, size in sorted(files, key=lambda x: x[1], reverse=True):
-            lines.append(f"{name} — {size//1024} KiB")
-
+        # Sort by size (largest first)
+        files.sort(key=lambda x: x[1], reverse=True)
+        
+        lines = [f"{name} — {format_size(size)}" for name, size in files[:50]]  # Limit to 50 files
         text = "\n".join(lines)
-        if len(text) > 1900:
-            text = text[:1900] + "\n... (truncated)"
+        text = truncate_message(text)
 
-        await update.message.reply_text(f"📁 Downloads:\n`{text}`", parse_mode='Markdown')
+        await update.message.reply_text(f"📁 Downloads ({len(files)} files):\n`{text}`", parse_mode='Markdown')
 
     except Exception as e:
+        logger.error(f"Error listing downloads: {e}")
         await update.message.reply_text(f"❌ Error listing downloads: {e}")
 
-
 async def aria_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: show aria2 status for a given GID or global stats.
-    Usage: /aria <gid>  or just /aria to show global stats
-    """
+    """Show aria2 status for GID or global stats"""
     if not is_owner(update):
         return
 
     try:
         args = context.args if hasattr(context, 'args') else []
+        
         if args:
             gid = args[0]
-            payload = {"jsonrpc":"2.0","id":"q","method":"aria2.tellStatus","params":[gid,["status","totalLength","completedLength","downloadSpeed","connections","numSeeders","numConnectedPeers"]]}
+            result = aria2_rpc_call(
+                "aria2.tellStatus",
+                [gid, ["status", "totalLength", "completedLength", "downloadSpeed", 
+                       "connections", "numSeeders", "numConnectedPeers"]]
+            )
         else:
-            payload = {"jsonrpc":"2.0","id":"q","method":"aria2.getGlobalStat","params":[]}
+            result = aria2_rpc_call("aria2.getGlobalStat")
 
-        resp = requests.post("http://127.0.0.1:6800/jsonrpc", json=payload, timeout=5)
-        if resp.ok:
-            text = resp.text
-            if len(text) > 1800:
-                text = text[:1800] + "... (truncated)"
+        if result:
+            text = truncate_message(str(result))
             await update.message.reply_text(f"✅ Aria2:\n`{text}`", parse_mode='Markdown')
         else:
-            await update.message.reply_text(f"❌ Aria2 RPC error: {resp.status_code} {resp.text}")
+            await update.message.reply_text("❌ Aria2 RPC error")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Execution Error: {e}")
-
+        logger.error(f"Aria status error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def forceupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: force upload a file from the downloads folder by partial filename match.
-    Usage: /forceupload <partial-or-full-filename>
-    """
+    """Force upload a file from downloads directory"""
     if not is_owner(update):
         return
 
     args = context.args if hasattr(context, 'args') else []
     if not args:
-        await update.message.reply_text("Usage: /forceupload <partial-or-full-filename>")
+        await update.message.reply_text("Usage: /forceupload <filename or pattern>")
         return
 
     query_raw = " ".join(args)
-    # Normalize query: remove non-alphanumeric, collapse whitespace, lowercase
-    def _normalize(s: str) -> str:
-        return re.sub(r'[^0-9a-z]+', ' ', s.lower()).strip()
-
-    query = _normalize(query_raw)
+    query_normalized = normalize_filename(query_raw)
 
     try:
-        if not os.path.exists(DOWNLOAD_DIR):
+        if not DOWNLOAD_DIR.exists():
             await update.message.reply_text("📭 Downloads directory does not exist.")
             return
 
-        matches = []
-        names = []
-        for entry in os.scandir(DOWNLOAD_DIR):
-            if entry.is_file():
-                names.append((entry.name, entry.path))
+        # Get all files
+        all_files = [(f.name, f) for f in DOWNLOAD_DIR.iterdir() if f.is_file()]
+        
+        if not all_files:
+            await update.message.reply_text("📭 No files in downloads directory.")
+            return
 
-        # First pass: normalized substring match
-        for name, path in names:
-            if query in _normalize(name):
+        # Find matches using normalized substring search
+        matches = []
+        for name, path in all_files:
+            if query_normalized in normalize_filename(name):
                 matches.append(path)
 
-        # If no normalized substring matches, try fuzzy matching on normalized names
+        # Fallback to fuzzy matching
         if not matches:
-            normalized_names = [(_normalize(n), p) for n, p in names]
-            choices = [n for n, p in normalized_names]
-            close = difflib.get_close_matches(query, choices, n=5, cutoff=0.6)
-            for c in close:
-                for n, p in normalized_names:
-                    if n == c:
-                        matches.append(p)
+            normalized_files = [(normalize_filename(n), p) for n, p in all_files]
+            choices = [n for n, _ in normalized_files]
+            close = difflib.get_close_matches(query_normalized, choices, n=5, cutoff=0.6)
+            
+            for match in close:
+                for norm_name, path in normalized_files:
+                    if norm_name == match:
+                        matches.append(path)
                         break
 
         if not matches:
-            # Suggest top filenames if available
-            suggestion_text = "\n".join([n for n, p in names][:10]) if names else "(no files)"
+            suggestions = "\n".join([n for n, _ in all_files[:10]])
             await update.message.reply_text(
-                "❌ No files matched that query in downloads.\nAvailable files:\n" + suggestion_text
+                f"❌ No files matched: `{query_raw}`\n\n"
+                f"Available files:\n{truncate_message(suggestions)}",
+                parse_mode='Markdown'
             )
             return
 
-        # If multiple matches, pick the largest (likely the target file)
-        matches.sort(key=lambda p: os.path.getsize(p), reverse=True)
-        file_path = matches[0]
-        file_size = os.path.getsize(file_path)
+        # Use largest file if multiple matches
+        file_path = max(matches, key=lambda p: p.stat().st_size)
+        file_size = file_path.stat().st_size
 
-        LIMIT_BYTES = 2000 * 1024 * 1024
-        if file_size > LIMIT_BYTES:
-            await update.message.reply_text(f"⚠️ File is larger than Telegram limit (2GB): {file_size} bytes")
+        if file_size > TELEGRAM_FILE_LIMIT:
+            await update.message.reply_text(
+                f"⚠️ File exceeds Telegram limit (2GB): {format_size(file_size)}"
+            )
             return
 
-        file_name = os.path.basename(file_path)
-        msg = await update.message.reply_text(f"⬆️ Forcing upload: `{file_name}` ({file_size//1024} KiB)...", parse_mode='Markdown')
+        msg = await update.message.reply_text(
+            f"⬆️ Uploading: `{file_path.name}` ({format_size(file_size)})...",
+            parse_mode='Markdown'
+        )
 
         try:
             with open(file_path, 'rb') as f:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=f,
-                    caption=f"📂 {file_name}",
+                    caption=f"📂 {file_path.name}",
                     read_timeout=600,
                     write_timeout=600,
-                    connect_timeout=300
+                    connect_timeout=60
                 )
+            
             await msg.delete()
-            # Remove file after successful upload to free space
+            
+            # Remove file after upload
             try:
-                os.remove(file_path)
-            except Exception:
-                logger.exception("Failed to remove uploaded file from disk")
-            await update.message.reply_text("✅ Forced upload finished and file removed.")
+                file_path.unlink()
+            except Exception as e:
+                logger.error(f"Failed to remove file: {e}")
+            
+            await update.message.reply_text("✅ Upload complete. File removed from disk.")
 
         except Exception as upload_error:
-            await msg.edit_text(f"❌ Upload Failed: {upload_error}")
+            logger.error(f"Force upload failed: {upload_error}")
+            await safe_edit_message(msg, f"❌ Upload Failed: {upload_error}")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Execution Error: {e}")
+        logger.error(f"Force upload error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+# --- WEBHOOK CLEANUP ---
+
+async def cleanup_webhook(token: str) -> bool:
+    """Delete existing webhook and wait for confirmation"""
+    try:
+        logger.info("Checking for existing webhook...")
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            timeout=10
+        )
+        
+        if not resp.ok:
+            logger.error(f"Failed to get webhook info: {resp.text}")
+            return False
+        
+        info = resp.json().get('result', {})
+        url = info.get('url')
+        
+        if not url:
+            logger.info("No webhook configured.")
+            return True
+        
+        logger.warning(f"Existing webhook detected: {url}. Removing...")
+        
+        del_resp = requests.post(
+            f"https://api.telegram.org/bot{token}/deleteWebhook",
+            timeout=10
+        )
+        
+        if not del_resp.ok or not del_resp.json().get('result'):
+            logger.error(f"Failed to delete webhook: {del_resp.text}")
+            return False
+        
+        # Wait for webhook to clear
+        for attempt in range(10):
+            await asyncio.sleep(1)
+            check_resp = requests.post(
+                f"https://api.telegram.org/bot{token}/getWebhookInfo",
+                timeout=10
+            )
+            
+            if check_resp.ok:
+                result = check_resp.json().get('result', {})
+                if not result.get('url'):
+                    logger.info("Webhook successfully cleared.")
+                    return True
+        
+        logger.warning("Webhook not cleared within timeout.")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Webhook cleanup error: {e}")
+        return False
 
 # --- MAIN ENTRY POINT ---
-if __name__ == '__main__':
+
+def setup_handlers(app_bot):
+    """Register all bot handlers"""
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("debugaria", debug_aria))
+    app_bot.add_handler(CommandHandler("lsdownloads", lsdownloads))
+    app_bot.add_handler(CommandHandler("aria", aria_status_cmd))
+    app_bot.add_handler(CommandHandler("forceupload", forceupload))
+    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
+    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+async def main():
+    """Main entry point"""
     if not BOT_TOKEN:
-        print("CRITICAL: BOT_TOKEN env variable is missing.")
+        logger.critical("BOT_TOKEN environment variable is missing.")
         exit(1)
-    # If using polling mode, ensure no webhook is set (Telegram will return 409 if webhook exists)
-    if not USE_WEBHOOK:
-        try:
-            logger.info("Checking Telegram webhook status before starting polling...")
-            resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=10)
-            if resp.ok:
-                info = resp.json().get('result', {})
-                url = info.get('url')
-                if url:
-                    logger.warning(f"Detected active webhook: {url}. Deleting webhook to allow polling.")
-                    delr = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
-                    if delr.ok and delr.json().get('result'):
-                        logger.info("Requested webhook deletion. Waiting for Telegram to clear webhook...")
-                        # Wait until Telegram reports no webhook URL or until timeout
-                        cleared = False
-                        for i in range(10):
-                            try:
-                                time.sleep(1)
-                                chk = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=10)
-                                if chk.ok:
-                                    result = chk.json().get('result', {})
-                                    if not result.get('url'):
-                                        cleared = True
-                                        logger.info("Webhook cleared by Telegram.")
-                                        break
-                                    else:
-                                        logger.info(f"Webhook still present, waiting... (attempt {i+1})")
-                            except Exception as ee:
-                                logger.debug(f"Error while checking webhook status: {ee}")
-                        if not cleared:
-                            logger.warning("Webhook was not cleared within timeout; polling may still receive 409 Conflict.")
-                    else:
-                        logger.error(f"Failed to delete webhook: {delr.text}")
-        except Exception as e:
-            logger.error(f"Failed to check/delete webhook: {e}")
-
-    # Start whichever web server is needed
+    
+    # Build application
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    setup_handlers(app_bot)
+    
     if USE_WEBHOOK:
-        # In webhook mode we will let the bot run the web server for incoming updates.
-        print("--- Starting Telegram Bot in WEBHOOK mode ---")
-        # Setup Bot
-        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-
-        # Add Handlers
-        app_bot.add_handler(CommandHandler("start", start))
-        app_bot.add_handler(CommandHandler("debugaria", debug_aria))
-        app_bot.add_handler(CommandHandler("lsdownloads", lsdownloads))
-        app_bot.add_handler(CommandHandler("aria", aria_status_cmd))
-        app_bot.add_handler(CommandHandler("forceupload", forceupload))
-        app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
-        app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
+        logger.info("Starting in WEBHOOK mode")
+        
         if not WEBHOOK_DOMAIN:
-            logger.error("WEBHOOK_DOMAIN or RENDER_EXTERNAL_URL is not set. Cannot register webhook.")
+            logger.error("WEBHOOK_DOMAIN or RENDER_EXTERNAL_URL is not set.")
             exit(1)
 
-        # Normalize WEBHOOK_DOMAIN: strip scheme and trailing slashes
+        # Parse and normalize domain
         parsed = urlparse(WEBHOOK_DOMAIN)
-        domain = parsed.netloc or parsed.path  # netloc when scheme present, else path
-        domain = domain.rstrip('/')
-
+        domain = (parsed.netloc or parsed.path).rstrip('/')
+        
         url_path = f"/webhook/{BOT_TOKEN}"
         port = int(os.environ.get('PORT', 8080))
         webhook_url = f"https://{domain}{url_path}"
-        logger.info(f"Registering webhook URL: {webhook_url}")
-
-        # Run webhook server that listens for Telegram updates
-        app_bot.run_webhook(
+        
+        logger.info(f"Webhook URL: {webhook_url}")
+        
+        # Run webhook
+        await app_bot.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=url_path,
             webhook_url=webhook_url
         )
     else:
-        print("--- Starting Keep-Alive Web Server ---")
-        # Run Flask in a separate thread (keeps the instance alive for Render)
-        server_thread = threading.Thread(target=run_web_server)
-        server_thread.daemon = True
+        logger.info("Starting in POLLING mode")
+        
+        # Cleanup webhook before polling
+        await cleanup_webhook(BOT_TOKEN)
+        
+        # Start keep-alive server in background
+        server_thread = threading.Thread(target=run_web_server, daemon=True)
         server_thread.start()
+        logger.info("Keep-alive server started")
+        
+        # Run polling
+        await app_bot.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
 
-        print("--- Starting Telegram Bot (polling) ---")
-        # Setup Bot
-        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-
-        # Add Handlers
-        app_bot.add_handler(CommandHandler("start", start))
-        app_bot.add_handler(CommandHandler("debugaria", debug_aria))
-        app_bot.add_handler(CommandHandler("lsdownloads", lsdownloads))
-        app_bot.add_handler(CommandHandler("aria", aria_status_cmd))
-        app_bot.add_handler(CommandHandler("forceupload", forceupload))
-        app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
-        app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-        # Run Bot (polling)
-        app_bot.run_polling()
+if __name__ == '__main__':
+    asyncio.run(main())
